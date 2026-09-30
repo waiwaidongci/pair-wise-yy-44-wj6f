@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { useWorkshopStore, type Cue, type Department } from '../stores/workshop'
+import { useWorkshopStore, type Cue, type Department, type Point } from '../stores/workshop'
+import { ROLE_LABELS } from '../lib/merge'
 
 const store = useWorkshopStore()
 const commentText = ref('')
@@ -12,19 +13,21 @@ const acts = ['全部', '第一幕', '第二幕', '第三幕']
 const cue = computed(() => store.selectedCue)
 const routePoints = computed(() => cue.value?.route.map((point) => `${point.x},${point.y}`).join(' ') ?? '')
 const conflictCues = computed(() => new Set(store.conflicts.map((item) => item.id)))
+const activeRoleLabel = computed(() => ROLE_LABELS[store.activeRole])
+const cueDiffCount = computed(() => (cue.value ? store.cueDiffs(cue.value.id).length : 0))
 
 function selectCue(item: Cue) {
   store.selectedId = item.id
 }
 
 function addWaypoint(event: MouseEvent) {
-  if (!showRouteEditor.value || store.locked) return
+  if (!showRouteEditor.value) return
   const target = event.currentTarget as SVGElement
   const rect = target.getBoundingClientRect()
   const x = Math.round(((event.clientX - rect.left) / rect.width) * 100)
   const y = Math.round(((event.clientY - rect.top) / rect.height) * 100)
   store.addWaypoint({ x, y })
-  ElMessage.success('已追加路线节点')
+  ElMessage.success(store.isOffline ? '已追加到离线路线' : '已追加路线节点')
 }
 
 function saveCue() {
@@ -42,6 +45,18 @@ function submitComment() {
 function updateCue(key: keyof Cue, value: unknown) {
   store.updateCue({ [key]: value } as Partial<Cue>)
 }
+
+function updateNode(nodeIndex: number, axis: 'x' | 'y', raw: string) {
+  const value = Number(raw)
+  if (!Number.isFinite(value)) return
+  const current = cue.value?.route[nodeIndex]
+  if (!current) return
+  store.updateRouteNode(nodeIndex, { x: current.x, y: current.y, [axis]: value })
+}
+
+function nodePair(point: Point): Point | undefined {
+  return point.pair
+}
 </script>
 
 <template>
@@ -58,6 +73,36 @@ function updateCue(key: keyof Cue, value: unknown) {
         <el-button type="primary" @click="saveCue">{{ store.isOffline ? '保存草稿' : '同步版本' }}</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="store.halted"
+      class="conflict-alert"
+      type="error"
+      show-icon
+      :closable="false"
+      title="演出基线已停住"
+      description="离线合并的差异影响互锁判断，打印中心保留旧版清单。请前往「离线协同」处理待核差异。"
+    />
+
+    <el-alert
+      v-if="store.isOffline"
+      class="conflict-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`离线编辑中 · 终端角色：${activeRoleLabel}`"
+      description="入场点、路线和触发时间的修改保存在本机队列，联网后按提示编号与对方合并。"
+    />
+
+    <el-alert
+      v-if="store.hasRevisionDraft && !store.isOffline"
+      class="conflict-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`基线已锁定 · 当前为修订稿 ${store.revision}`"
+      description="锁定后的改动另开修订稿，不影响已锁定的演出基线。"
+    />
 
     <el-alert
       v-if="store.conflicts.length"
@@ -85,8 +130,11 @@ function updateCue(key: keyof Cue, value: unknown) {
         <el-slider v-model="store.zoom" :min="70" :max="150" :step="5" style="width: 150px" />
       </div>
       <el-switch v-model="showRouteEditor" active-text="路线编辑" />
-      <el-button @click="store.addCue" :disabled="store.locked">新增提示</el-button>
-      <el-tag :type="store.locked ? 'success' : 'info'" effect="plain">{{ store.locked ? '基线已锁定' : '草稿编辑中' }}</el-tag>
+      <el-button @click="store.addCue">新增提示</el-button>
+      <el-tag :type="store.locked ? 'success' : 'info'" effect="plain">
+        {{ store.isOffline ? `离线 · ${activeRoleLabel}` : store.locked ? '基线已锁定' : '草稿编辑中' }}
+      </el-tag>
+      <el-tag v-if="cueDiffCount" type="danger" effect="dark">本提示 {{ cueDiffCount }} 项待核</el-tag>
     </div>
 
     <div class="work-grid">
@@ -119,6 +167,15 @@ function updateCue(key: keyof Cue, value: unknown) {
                   :class="['route', { selected: item.id === store.selectedId, conflict: conflictCues.has(item.id) }]"
                   marker-end="url(#arrow)"
                 />
+                <g v-for="(point, index) in item.route" :key="`pair-${item.id}-${index}`">
+                  <circle
+                    v-if="point.pair"
+                    :cx="point.pair.x"
+                    :cy="point.pair.y"
+                    r="1.6"
+                    class="pair-point"
+                  />
+                </g>
                 <g class="cue-point" :class="{ selected: item.id === store.selectedId }" @click.stop="selectCue(item)">
                   <circle :cx="item.entry.x" :cy="item.entry.y" r="2.8" />
                   <text :x="item.entry.x + 3.2" :y="item.entry.y + 1">{{ item.id }}</text>
@@ -148,7 +205,7 @@ function updateCue(key: keyof Cue, value: unknown) {
             <el-tag :type="cue.status === '已确认' ? 'success' : 'warning'" effect="plain">{{ cue.status }}</el-tag>
           </div>
 
-          <el-form label-position="top" size="small" :disabled="store.locked">
+          <el-form label-position="top" size="small">
             <div class="form-grid">
               <el-form-item label="场景">
                 <el-input :model-value="cue.scene" @update:model-value="updateCue('scene', $event)" />
@@ -170,7 +227,20 @@ function updateCue(key: keyof Cue, value: unknown) {
             </el-form-item>
             <el-form-item label="路线节点 / 触发时机">
               <div class="route-summary">
-                <span v-for="(point, index) in cue.route" :key="index">{{ index === 0 ? '入' : index === cue.route.length - 1 ? '出' : index }} ({{ point.x }},{{ point.y }})</span>
+                <span v-for="(point, index) in cue.route" :key="index" class="route-node">
+                  <em>{{ index === 0 ? '入' : index === cue.route.length - 1 ? '出' : index }}</em>
+                  <label>
+                    x
+                    <input type="number" :value="point.x" @input="updateNode(index, 'x', ($event.target as HTMLInputElement).value)" />
+                  </label>
+                  <label>
+                    y
+                    <input type="number" :value="point.y" @input="updateNode(index, 'y', ($event.target as HTMLInputElement).value)" />
+                  </label>
+                  <template v-if="nodePair(point)">
+                    <i class="pair-marker" :title="`待核差异：对方坐标 (${nodePair(point)!.x}, ${nodePair(point)!.y})`">待核</i>
+                  </template>
+                </span>
               </div>
             </el-form-item>
           </el-form>
@@ -211,12 +281,13 @@ function updateCue(key: keyof Cue, value: unknown) {
           v-for="item in [...store.filteredCues].sort((a, b) => a.time.localeCompare(b.time))"
           :key="item.id"
           class="cue-card"
-          :class="{ active: item.id === store.selectedId, conflict: conflictCues.has(item.id) }"
+          :class="{ active: item.id === store.selectedId, conflict: conflictCues.has(item.id), diff: store.cueDiffs(item.id).length > 0 }"
           @click="selectCue(item)"
         >
           <span>{{ item.id }} · {{ item.department }}</span>
           <strong>{{ item.title }}</strong>
           <small>{{ item.time }} · {{ item.duration }} 秒</small>
+          <em v-if="store.cueDiffs(item.id).length" class="diff-badge">{{ store.cueDiffs(item.id).length }} 项待核</em>
         </button>
       </div>
     </section>
@@ -442,13 +513,67 @@ function updateCue(key: keyof Cue, value: unknown) {
   gap: 5px;
 }
 
-.route-summary span {
+.route-node {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   padding: 3px 6px;
   border: 1px solid #dbe2e5;
   border-radius: 4px;
   color: #53606c;
   background: #f6f8f8;
   font-size: 11px;
+}
+
+.route-node em {
+  color: #2f8580;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.route-node label {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.route-node input {
+  width: 42px;
+  padding: 2px 4px;
+  border: 1px solid #cdd8dc;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.pair-marker {
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: #fff;
+  background: #c36e23;
+  font-style: normal;
+  font-size: 10px;
+}
+
+.pair-point {
+  fill: #c36e23;
+  stroke: #fff;
+  stroke-width: 0.4;
+  stroke-dasharray: 1 0.6;
+}
+
+.cue-card.diff {
+  border-left: 4px solid #c36e23;
+}
+
+.diff-badge {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: #fff;
+  background: #c36e23;
+  font-style: normal;
+  font-size: 10px;
 }
 
 .comment-block {

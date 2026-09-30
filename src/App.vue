@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useWorkshopStore } from './stores/workshop'
+import { ROLE_COLORS, ROLE_LABELS, type Role } from './lib/merge'
 
 const route = useRoute()
 const store = useWorkshopStore()
@@ -12,8 +13,11 @@ const nav = [
   { to: '/', label: '巡演总览', icon: '总' },
   { to: '/stage', label: '舞台走位', icon: '图' },
   { to: '/script', label: '排练脚本', icon: '序' },
+  { to: '/sync', label: '离线协同', icon: '协' },
   { to: '/print', label: '打印中心', icon: '印' },
 ]
+
+const roleOptions: Role[] = ['stage-manager', 'foh-director']
 </script>
 
 <template>
@@ -52,8 +56,22 @@ const nav = [
           {{ store.isOffline ? '离线草稿已保存' : '协作服务正常' }}
         </div>
         <p>版本 {{ store.revision }} · {{ store.lastSaved }}</p>
+        <div v-if="store.halted" class="side-halt">互锁差异待核，基线停住</div>
+        <div v-if="store.hasRevisionDraft" class="side-draft">修订稿 {{ store.revision }}（草稿）</div>
+        <div class="side-roles">
+          <button
+            v-for="role in roleOptions"
+            :key="role"
+            class="side-role"
+            :class="{ active: store.activeRole === role }"
+            :style="store.activeRole === role ? { background: ROLE_COLORS[role], borderColor: ROLE_COLORS[role] } : {}"
+            @click="store.setRole(role)"
+          >
+            {{ ROLE_LABELS[role] }}
+          </button>
+        </div>
         <button class="ghost-button" @click="store.toggleOffline">
-          {{ store.isOffline ? '恢复连接' : '模拟离线' }}
+          {{ store.isOffline ? '恢复连接并合并' : '模拟离线' }}
         </button>
       </div>
     </aside>
@@ -175,6 +193,45 @@ const nav = [
   color: #d9e4e9;
   background: transparent;
   cursor: pointer;
+}
+
+.side-halt,
+.side-draft {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+}
+
+.side-halt {
+  color: #f0c6b8;
+  background: rgb(217 154 43 / 18%);
+}
+
+.side-draft {
+  color: #bfe3dd;
+  background: rgb(47 133 128 / 18%);
+}
+
+.side-roles {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.side-role {
+  flex: 1;
+  padding: 6px 4px;
+  border: 1px solid #426172;
+  border-radius: 6px;
+  color: #b9c9d3;
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.side-role.active {
+  color: #fff;
 }
 
 .content {

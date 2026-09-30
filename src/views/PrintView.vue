@@ -15,7 +15,7 @@ function print() {
 function exportCsv() {
   const rows = [
     ['编号', '时间码', '场景', '提示', '部门', '责任', '路线节点', '状态'],
-    ...store.cues.map((cue) => [
+    ...store.printCues.map((cue) => [
       cue.id,
       cue.time,
       `${cue.act}/${cue.scene}`,
@@ -51,12 +51,24 @@ function exportCsv() {
       </div>
     </div>
 
+    <div v-if="store.halted" class="print-halt no-print">
+      <el-alert
+        type="error"
+        show-icon
+        :closable="false"
+        title="演出基线已停住，打印中心保留旧版清单"
+        description="离线合并的差异影响互锁判断，当前打印的是停住前的最后一版基线。请前往「离线协同」处理待核差异后再输出。"
+      />
+    </div>
+
     <div class="print-options panel no-print">
       <strong>文档内容</strong>
       <el-checkbox v-model="includeNotes">执行说明</el-checkbox>
       <el-checkbox v-model="includeRoutes">路线坐标</el-checkbox>
       <el-checkbox v-model="includeComments">未解决留言</el-checkbox>
-      <span class="print-revision">版本 {{ store.revision }} · 生成于 {{ new Date().toLocaleString('zh-CN') }}</span>
+      <span class="print-revision">
+        {{ store.halted ? '旧版清单' : store.hasRevisionDraft ? '修订稿' : '基线版本' }} {{ store.revision }} · 生成于 {{ new Date().toLocaleString('zh-CN') }}
+      </span>
     </div>
 
     <article class="print-sheet">
@@ -84,13 +96,19 @@ function exportCsv() {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="cue in [...store.cues].sort((a, b) => a.time.localeCompare(b.time))" :key="cue.id">
+          <tr v-for="cue in [...store.printCues].sort((a, b) => a.time.localeCompare(b.time))" :key="cue.id">
             <td class="mono">{{ cue.time }}</td>
             <td>{{ cue.act }} / {{ cue.scene }}</td>
             <td>
               <strong>{{ cue.id }} · {{ cue.title }}</strong>
               <p v-if="includeNotes">{{ cue.note }}</p>
-              <small v-if="includeRoutes">路线：{{ cue.route.map((point, index) => `${index + 1}. ${point.x}/${point.y}`).join(' → ') }}</small>
+              <small v-if="includeRoutes">
+                路线：
+                <template v-for="(point, index) in cue.route" :key="index">
+                  {{ index + 1 }}. {{ point.x }}/{{ point.y }}<template v-if="point.pair"> 或 {{ point.pair.x }}/{{ point.pair.y }}（待核）</template>
+                  <template v-if="index < cue.route.length - 1"> → </template>
+                </template>
+              </small>
               <em v-if="includeComments && cue.comments.length">{{ cue.comments.filter((item) => !item.resolved).length }} 条未解决留言</em>
             </td>
             <td>{{ cue.department }}<br /><small>{{ cue.owner }}</small></td>
@@ -112,6 +130,10 @@ function exportCsv() {
 <style scoped>
 .print-page {
   background: #e8ecee;
+}
+
+.print-halt {
+  margin-bottom: 12px;
 }
 
 .print-options {

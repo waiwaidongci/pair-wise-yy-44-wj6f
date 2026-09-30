@@ -1,8 +1,20 @@
 import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
+import { ElMessage } from 'element-plus'
+import {
+  consolidateDraft,
+  diffCue,
+  isHalted,
+  pendingDiffCount,
+  resolveDiff as resolveMergeDiff,
+  threeWayMerge,
+  type CueMergeResult,
+  type OfflineOp,
+  type Role,
+} from '../lib/merge'
 
 export type Department = '舞台' | '灯光' | '音响' | '道具'
-export type Point = { x: number; y: number }
+export type Point = { x: number; y: number; clientId?: string; pair?: Point }
 
 export type Comment = {
   id: string
@@ -27,6 +39,7 @@ export type Cue = {
   note: string
   status: '草稿' | '待确认' | '已确认'
   comments: Comment[]
+  interlocked?: boolean
 }
 
 export const seedProject = {
@@ -109,6 +122,7 @@ export const seedCues: Cue[] = [
     route: [{ x: 50, y: 12 }],
     note: '与机械动作互锁，机械未到位禁止触发。',
     status: '待确认',
+    interlocked: true,
     comments: [],
   },
   {
@@ -147,15 +161,53 @@ export const seedCues: Cue[] = [
 
 const STORAGE_KEY = 'stage-scheduler-draft-v1'
 
+type PersistedState = {
+  cues?: Cue[]
+  revision?: number
+  offlineQueue?: OfflineOp[]
+  appliedClientIds?: Record<string, string[]>
+  revisionDraft?: Cue[] | null
+  lastGoodBaseline?: Cue[]
+  halted?: boolean
+  mergeResults?: CueMergeResult[]
+  stagedCues?: Cue[] | null
+}
+
+function loadPersisted(): PersistedState {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    return raw ? (JSON.parse(raw) as PersistedState) : {}
+  } catch {
+    return {}
+  }
+}
+
+const SCALAR_FIELDS = [
+  'act',
+  'scene',
+  'time',
+  'title',
+  'department',
+  'owner',
+  'duration',
+  'entry',
+  'exit',
+  'note',
+  'status',
+] as const
+
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
 export const useWorkshopStore = defineStore('workshop', () => {
-  const saved = localStorage.getItem(STORAGE_KEY)
-  const restored = saved ? (JSON.parse(saved) as { cues?: Cue[]; revision?: number }) : null
-  const cues = ref<Cue[]>(restored?.cues?.length ? restored.cues : structuredClone(seedCues))
+  const restored = loadPersisted()
+  const cues = ref<Cue[]>(restored.cues?.length ? restored.cues : clone(seedCues))
   const selectedId = ref('C-01')
   const zoom = ref(100)
   const actFilter = ref('全部')
   const departmentFilter = ref('全部')
-  const rev = ref(restored?.revision ?? 12)
+  const rev = ref(restored.revision ?? 12)
   const revision = computed(() => `R${rev.value}`)
   const lastSaved = ref('刚刚自动保存')
   const isOffline = ref(false)
@@ -163,37 +215,97 @@ export const useWorkshopStore = defineStore('workshop', () => {
   const undoStack = ref<Cue[][]>([])
   const redoStack = ref<Cue[][]>([])
 
-  const selectedCue = computed(() => cues.value.find((cue) => cue.id === selectedId.value) ?? cues.value[0])
+  // --- offline collaboration state ---
+  const activeRole = ref<Role>('stage-manager')
+  const offlineDrafts = ref<Record<Role, Cue[] | null>>({ 'stage-manager': null, 'foh-director': null })
+  const offlineQueue = ref<OfflineOp[]>(restored.offlineQueue ?? [])
+  const appliedClientIds = ref<Record<string, string[]>>(restored.appliedClientIds ?? {})
+  const revisionDraft = ref<Cue[] | null>(restored.revisionDraft ?? null)
+  const lastGoodBaseline = ref<Cue[]>(restored.lastGoodBaseline ?? clone(seedCues))
+  const halted = ref(restored.halted ?? false)
+  const mergeResults = ref<CueMergeResult[]>(restored.mergeResults ?? [])
+  const stagedCues = ref<Cue[] | null>(restored.stagedCues ?? null)
+  const forceMergeFailure = ref(false)
+  const mergeLog = ref<Array<{ at: string; count: number; summary: string }>>([])
+
+  const displayCues = computed(() => {
+    if (isOffline.value) return offlineDrafts.value[activeRole.value] ?? cues.value
+    return revisionDraft.value ?? cues.value
+  })
+  const selectedCue = computed(() => displayCues.value.find((cue) => cue.id === selectedId.value) ?? displayCues.value[0])
   const filteredCues = computed(() =>
-    cues.value.filter(
+    displayCues.value.filter(
       (cue) =>
         (actFilter.value === '全部' || cue.act === actFilter.value) &&
         (departmentFilter.value === '全部' || cue.department === departmentFilter.value),
     ),
   )
   const conflicts = computed(() =>
-    cues.value.filter((cue, index) =>
-      cues.value.some((other, otherIndex) => otherIndex !== index && other.time === cue.time && other.scene === cue.scene),
+    displayCues.value.filter((cue, index) =>
+      displayCues.value.some((other, otherIndex) => otherIndex !== index && other.time === cue.time && other.scene === cue.scene),
     ),
   )
 
+  const printCues = computed(() => {
+    if (halted.value) return lastGoodBaseline.value
+    return revisionDraft.value ?? cues.value
+  })
+  const pendingOps = computed(() => offlineQueue.value.filter((op) => op.status !== 'merged'))
+  const pendingDiffs = computed(() => mergeResults.value.flatMap((result) => result.diffs).filter((diff) => diff.status === 'pending'))
+  const interlockDiffs = computed(() => pendingDiffs.value.filter((diff) => diff.interlockAffected))
+  const canApply = computed(() => mergeResults.value.length > 0 && !halted.value && pendingDiffs.value.length === 0)
+  const hasRevisionDraft = computed(() => revisionDraft.value !== null)
+
   watch(
-    [cues, rev, isOffline],
+    [cues, rev, isOffline, offlineQueue, appliedClientIds, revisionDraft, lastGoodBaseline, halted, mergeResults, stagedCues],
     () => {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ cues: cues.value, revision: rev.value }))
+      const payload: PersistedState = {
+        cues: cues.value,
+        revision: rev.value,
+        offlineQueue: offlineQueue.value,
+        appliedClientIds: appliedClientIds.value,
+        revisionDraft: revisionDraft.value,
+        lastGoodBaseline: lastGoodBaseline.value,
+        halted: halted.value,
+        mergeResults: mergeResults.value,
+        stagedCues: stagedCues.value,
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload))
       lastSaved.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
     },
     { deep: true },
   )
 
   function snapshot() {
-    undoStack.value.push(structuredClone(cues.value))
+    undoStack.value.push(clone(cues.value))
     if (undoStack.value.length > 20) undoStack.value.shift()
     redoStack.value = []
   }
 
+  function ensureRevisionDraft() {
+    if (!revisionDraft.value) {
+      revisionDraft.value = clone(cues.value)
+    }
+  }
+
   function updateCue(patch: Partial<Cue>, addRevision = true) {
-    if (locked.value) return
+    if (isOffline.value) {
+      const draft = offlineDrafts.value[activeRole.value]
+      if (!draft) return
+      const index = draft.findIndex((cue) => cue.id === selectedId.value)
+      if (index < 0) return
+      draft[index] = { ...draft[index], ...patch }
+      recordEdit(selectedId.value)
+      return
+    }
+    if (locked.value) {
+      ensureRevisionDraft()
+      const index = revisionDraft.value!.findIndex((cue) => cue.id === selectedId.value)
+      if (index < 0) return
+      revisionDraft.value![index] = { ...revisionDraft.value![index], ...patch }
+      rev.value += 1
+      return
+    }
     snapshot()
     const index = cues.value.findIndex((cue) => cue.id === selectedId.value)
     if (index < 0) return
@@ -202,13 +314,104 @@ export const useWorkshopStore = defineStore('workshop', () => {
   }
 
   function addWaypoint(point: { x: number; y: number }) {
+    if (isOffline.value) {
+      const draft = offlineDrafts.value[activeRole.value]
+      if (!draft) return
+      const cue = draft.find((item) => item.id === selectedId.value)
+      if (!cue) return
+      cue.route.push({ x: point.x, y: point.y, clientId: `route-${crypto.randomUUID()}` })
+      recordEdit(selectedId.value)
+      return
+    }
+    if (locked.value) {
+      ensureRevisionDraft()
+      const cue = revisionDraft.value!.find((item) => item.id === selectedId.value)
+      if (!cue) return
+      cue.route.push({ x: point.x, y: point.y })
+      rev.value += 1
+      return
+    }
     const cue = selectedCue.value
     if (!cue) return
     updateCue({ route: [...cue.route, point] })
   }
 
+  function updateRouteNode(nodeIndex: number, point: { x: number; y: number }) {
+    if (isOffline.value) {
+      const draft = offlineDrafts.value[activeRole.value]
+      if (!draft) return
+      const cue = draft.find((item) => item.id === selectedId.value)
+      if (!cue || !cue.route[nodeIndex]) return
+      cue.route[nodeIndex] = { ...cue.route[nodeIndex], x: point.x, y: point.y }
+      recordEdit(selectedId.value)
+      return
+    }
+    if (locked.value) {
+      ensureRevisionDraft()
+      const cue = revisionDraft.value!.find((item) => item.id === selectedId.value)
+      if (!cue || !cue.route[nodeIndex]) return
+      cue.route[nodeIndex] = { ...cue.route[nodeIndex], x: point.x, y: point.y }
+      rev.value += 1
+      return
+    }
+    const cue = selectedCue.value
+    if (!cue || !cue.route[nodeIndex]) return
+    snapshot()
+    const route = [...cue.route]
+    route[nodeIndex] = { ...route[nodeIndex], x: point.x, y: point.y }
+    updateCue({ route })
+  }
+
   function addCue() {
-    if (locked.value) return
+    if (isOffline.value) {
+      const draft = offlineDrafts.value[activeRole.value]
+      if (!draft) return
+      const next = draft.length + 1
+      const cue: Cue = {
+        id: `C-${String(next).padStart(2, '0')}`,
+        act: '第一幕',
+        scene: '新场景',
+        time: '00:00:00',
+        title: '新执行提示',
+        department: '舞台',
+        owner: '待指派',
+        duration: 30,
+        entry: { x: 10, y: 50 },
+        exit: { x: 90, y: 50 },
+        route: [{ x: 10, y: 50, clientId: `route-${crypto.randomUUID()}` }, { x: 90, y: 50, clientId: `route-${crypto.randomUUID()}` }],
+        note: '',
+        status: '草稿',
+        comments: [],
+      }
+      draft.push(cue)
+      selectedId.value = cue.id
+      recordEdit(cue.id)
+      return
+    }
+    if (locked.value) {
+      ensureRevisionDraft()
+      const next = revisionDraft.value!.length + 1
+      const cue: Cue = {
+        id: `C-${String(next).padStart(2, '0')}`,
+        act: '第一幕',
+        scene: '新场景',
+        time: '00:00:00',
+        title: '新执行提示',
+        department: '舞台',
+        owner: '待指派',
+        duration: 30,
+        entry: { x: 10, y: 50 },
+        exit: { x: 90, y: 50 },
+        route: [{ x: 10, y: 50 }, { x: 90, y: 50 }],
+        note: '',
+        status: '草稿',
+        comments: [],
+      }
+      revisionDraft.value!.push(cue)
+      selectedId.value = cue.id
+      rev.value += 1
+      return
+    }
     snapshot()
     const next = cues.value.length + 1
     const cue: Cue = {
@@ -233,22 +436,53 @@ export const useWorkshopStore = defineStore('workshop', () => {
   }
 
   function undo() {
+    if (isOffline.value) return
     const previous = undoStack.value.pop()
     if (!previous) return
-    redoStack.value.push(structuredClone(cues.value))
+    redoStack.value.push(clone(cues.value))
     cues.value = previous
     rev.value += 1
   }
 
   function redo() {
+    if (isOffline.value) return
     const next = redoStack.value.pop()
     if (!next) return
-    undoStack.value.push(structuredClone(cues.value))
+    undoStack.value.push(clone(cues.value))
     cues.value = next
     rev.value += 1
   }
 
   function addComment(content: string, author = '当前用户') {
+    if (isOffline.value) {
+      const draft = offlineDrafts.value[activeRole.value]
+      if (!draft) return
+      const cue = draft.find((item) => item.id === selectedId.value)
+      if (!cue) return
+      cue.comments.push({
+        id: `comment-${crypto.randomUUID()}`,
+        author,
+        content,
+        createdAt: new Date().toLocaleString('zh-CN'),
+        resolved: false,
+      })
+      recordEdit(selectedId.value)
+      return
+    }
+    if (locked.value) {
+      ensureRevisionDraft()
+      const cue = revisionDraft.value!.find((item) => item.id === selectedId.value)
+      if (!cue) return
+      cue.comments.push({
+        id: `comment-${crypto.randomUUID()}`,
+        author,
+        content,
+        createdAt: new Date().toLocaleString('zh-CN'),
+        resolved: false,
+      })
+      rev.value += 1
+      return
+    }
     const cue = selectedCue.value
     if (!cue) return
     snapshot()
@@ -277,11 +511,229 @@ export const useWorkshopStore = defineStore('workshop', () => {
 
   function unlockBaseline() {
     locked.value = false
+    revisionDraft.value = null
     rev.value += 1
   }
 
+  // --- offline / merge orchestration ---
+
+  function setRole(role: Role) {
+    activeRole.value = role
+  }
+
+  function goOffline() {
+    if (!offlineDrafts.value['stage-manager'] || !offlineDrafts.value['foh-director']) {
+      offlineDrafts.value = {
+        'stage-manager': clone(cues.value),
+        'foh-director': clone(cues.value),
+      }
+    }
+    isOffline.value = true
+  }
+
+  function clearDrafts() {
+    offlineDrafts.value = { 'stage-manager': null, 'foh-director': null }
+  }
+
+  function goOnline() {
+    isOffline.value = false
+    clearDrafts()
+    if (pendingOps.value.length > 0) {
+      mergeNow()
+    }
+  }
+
   function toggleOffline() {
-    isOffline.value = !isOffline.value
+    if (isOffline.value) goOnline()
+    else goOffline()
+  }
+
+  function recordEdit(cueId: string) {
+    const draft = offlineDrafts.value[activeRole.value]
+    if (!draft) return
+    const base = cues.value.find((cue) => cue.id === cueId)
+    const draftCue = draft.find((cue) => cue.id === cueId)
+    if (!draftCue) return
+
+    let fields: OfflineOp['fields'] = {}
+    let routeNodes: OfflineOp['routeNodes'] = {}
+    let routeAppends: OfflineOp['routeAppends'] = []
+    let commentAppends: OfflineOp['commentAppends'] = []
+
+    if (base) {
+      const diff = diffCue(base, draftCue)
+      fields = diff.fields
+      routeNodes = diff.routeNodes
+      routeAppends = diff.routeAppends
+      commentAppends = diff.commentAppends
+    } else {
+      // Cue created offline: everything is an append relative to the baseline.
+      for (const field of SCALAR_FIELDS) {
+        const value = (draftCue as Record<string, unknown>)[field]
+        if (value !== undefined) fields[field] = { from: null, to: clone(value) }
+      }
+      routeAppends = draftCue.route
+        .filter((point) => point.clientId)
+        .map((point) => ({ clientId: point.clientId as string, point: { x: point.x, y: point.y } }))
+      commentAppends = draftCue.comments.map((comment) => ({ clientId: comment.id, comment: clone(comment) }))
+    }
+
+    const hasChanges =
+      Object.keys(fields).length > 0 ||
+      Object.keys(routeNodes).length > 0 ||
+      routeAppends.length > 0 ||
+      commentAppends.length > 0
+
+    const key = `${activeRole.value}:${cueId}`
+    const index = offlineQueue.value.findIndex((op) => `${op.role}:${op.cueId}` === key && op.status !== 'merged')
+    if (!hasChanges) {
+      if (index >= 0) offlineQueue.value.splice(index, 1)
+      return
+    }
+    const existing = index >= 0 ? offlineQueue.value[index] : null
+    const op: OfflineOp = {
+      opId: existing?.opId ?? `op-${activeRole.value}-${cueId}-${Date.now()}`,
+      cueId,
+      role: activeRole.value,
+      savedAt: new Date().toISOString(),
+      baseRevision: rev.value,
+      fields,
+      routeNodes,
+      routeAppends,
+      commentAppends,
+      status: 'pending',
+      attempts: existing?.attempts ?? 0,
+    }
+    if (index >= 0) offlineQueue.value[index] = op
+    else offlineQueue.value.push(op)
+  }
+
+  function collectAppliedIds(results: CueMergeResult[]) {
+    for (const result of results) {
+      const ids: string[] = []
+      result.merged.route.forEach((point) => {
+        if (point.clientId) ids.push(point.clientId as string)
+      })
+      result.merged.comments.forEach((comment) => ids.push(comment.id))
+      appliedClientIds.value[result.cueId] = [
+        ...new Set([...(appliedClientIds.value[result.cueId] ?? []), ...ids]),
+      ]
+    }
+  }
+
+  function applyCues(next: Cue[]) {
+    if (locked.value) {
+      revisionDraft.value = clone(next)
+    } else {
+      cues.value = clone(next)
+      lastGoodBaseline.value = clone(next)
+    }
+    rev.value += 1
+  }
+
+  function mergeNow() {
+    const pending = offlineQueue.value.filter((op) => op.status !== 'merged')
+    if (pending.length === 0) {
+      ElMessage.info('没有待合并的离线操作')
+      return
+    }
+    if (forceMergeFailure.value) {
+      pending.forEach((op) => {
+        op.status = 'failed'
+        op.attempts += 1
+        op.lastError = '模拟合并失败：服务端未确认，本机队列保留待重试'
+      })
+      ElMessage.error('合并失败：本机队列已保留，可在网络恢复后重试')
+      return
+    }
+
+    const localOps = offlineQueue.value.filter((op) => op.role === 'stage-manager' && op.status !== 'merged')
+    const remoteOps = offlineQueue.value.filter((op) => op.role === 'foh-director' && op.status !== 'merged')
+    const applied = new Set<string>()
+    Object.values(appliedClientIds.value).forEach((ids) => ids.forEach((id) => applied.add(id)))
+
+    const result = threeWayMerge(cues.value, localOps, remoteOps, applied)
+    pending.forEach((op) => {
+      op.status = 'merged'
+      op.attempts += 1
+    })
+    collectAppliedIds(result.results)
+    mergeResults.value = result.results
+    mergeLog.value.unshift({
+      at: new Date().toLocaleString('zh-CN'),
+      count: pending.length,
+      summary: result.halted ? '合并完成但互锁差异令基线停住' : '合并完成并并入基线',
+    })
+
+    if (result.halted) {
+      halted.value = true
+      stagedCues.value = result.cues
+      ElMessage.warning('差异影响互锁判断，演出基线已停住，打印中心保留旧版清单')
+    } else {
+      applyCues(result.cues)
+      stagedCues.value = null
+      ElMessage.success('离线操作已按提示编号合并并入基线')
+    }
+  }
+
+  function retryMerge() {
+    mergeNow()
+  }
+
+  function resolveDiff(cueId: string, field: string, nodeIndex: number | undefined, choice: 'local' | 'remote') {
+    const wasHalted = halted.value
+    mergeResults.value = resolveMergeDiff(mergeResults.value, cueId, field, nodeIndex, choice)
+
+    if (wasHalted) {
+      stagedCues.value = mergeResults.value.map((result) => result.merged)
+      if (isHalted(mergeResults.value)) return
+      // Halt cleared: release the frozen baseline and apply all staged changes.
+      halted.value = false
+      applyCues(stagedCues.value)
+      mergeResults.value = []
+      stagedCues.value = null
+      ElMessage.success('互锁差异已处理，基线恢复并并入')
+      return
+    }
+
+    // Not halted: the merged cues are already in the baseline; apply the resolved cue.
+    const result = mergeResults.value.find((item) => item.cueId === cueId)
+    if (result) {
+      if (locked.value) {
+        ensureRevisionDraft()
+        const index = revisionDraft.value!.findIndex((cue) => cue.id === cueId)
+        if (index >= 0) revisionDraft.value![index] = clone(result.merged)
+      } else {
+        const index = cues.value.findIndex((cue) => cue.id === cueId)
+        if (index >= 0) cues.value[index] = clone(result.merged)
+        lastGoodBaseline.value = clone(cues.value)
+      }
+      rev.value += 1
+    }
+    if (pendingDiffs.value.length === 0) {
+      mergeResults.value = []
+      stagedCues.value = null
+      ElMessage.success('差异已处理完毕，基线已更新')
+    }
+  }
+
+  function discardStaged() {
+    mergeResults.value = []
+    stagedCues.value = null
+    halted.value = false
+    ElMessage.info('已放弃待并入的合并结果，基线保持旧版')
+  }
+
+  function removeOp(opId: string) {
+    const index = offlineQueue.value.findIndex((op) => op.opId === opId)
+    if (index >= 0) offlineQueue.value.splice(index, 1)
+  }
+
+  function cueDiffs(cueId: string) {
+    return mergeResults.value
+      .filter((result) => result.cueId === cueId)
+      .flatMap((result) => result.diffs)
+      .filter((diff) => diff.status === 'pending')
   }
 
   return {
@@ -290,6 +742,8 @@ export const useWorkshopStore = defineStore('workshop', () => {
     selectedCue,
     filteredCues,
     conflicts,
+    printCues,
+    displayCues,
     zoom,
     actFilter,
     departmentFilter,
@@ -301,6 +755,7 @@ export const useWorkshopStore = defineStore('workshop', () => {
     canRedo: computed(() => redoStack.value.length > 0),
     updateCue,
     addWaypoint,
+    updateRouteNode,
     addCue,
     undo,
     redo,
@@ -308,6 +763,33 @@ export const useWorkshopStore = defineStore('workshop', () => {
     toggleComment,
     lockBaseline,
     unlockBaseline,
+    // offline / merge
+    activeRole,
+    offlineDrafts,
+    offlineQueue,
+    appliedClientIds,
+    revisionDraft,
+    lastGoodBaseline,
+    halted,
+    mergeResults,
+    stagedCues,
+    forceMergeFailure,
+    mergeLog,
+    pendingOps,
+    pendingDiffs,
+    interlockDiffs,
+    canApply,
+    hasRevisionDraft,
+    setRole,
+    goOffline,
+    goOnline,
     toggleOffline,
+    recordEdit,
+    mergeNow,
+    retryMerge,
+    resolveDiff,
+    discardStaged,
+    removeOp,
+    cueDiffs,
   }
 })
