@@ -11,6 +11,7 @@ const title = computed(() => String(route.meta.title ?? '巡演舞台'))
 const nav = [
   { to: '/', label: '巡演总览', icon: '总' },
   { to: '/stage', label: '舞台走位', icon: '图' },
+  { to: '/sync', label: '断网合并', icon: '并' },
   { to: '/script', label: '排练脚本', icon: '序' },
   { to: '/print', label: '打印中心', icon: '印' },
 ]
@@ -48,10 +49,12 @@ const nav = [
 
       <div class="side-card">
         <div class="side-card-title">
-          <span class="status-dot" :style="{ background: store.isOffline ? '#d99a2b' : '#45a878' }" />
-          {{ store.isOffline ? '离线草稿已保存' : '协作服务正常' }}
+          <span class="status-dot" :style="{ background: store.baselineHeld ? '#cf4436' : store.isOffline ? '#d99a2b' : '#45a878' }" />
+          {{ store.baselineHeld ? '基线停住 · 待核互锁差异' : store.isOffline ? '断网保存中' : '协作服务正常' }}
         </div>
         <p>版本 {{ store.revision }} · {{ store.lastSaved }}</p>
+        <p v-if="store.offlineOps.length" class="queue-note">本机队列 {{ store.offlineOps.length }} 条待合并</p>
+        <RouterLink class="ghost-link" to="/sync">断网合并台</RouterLink>
         <button class="ghost-button" @click="store.toggleOffline">
           {{ store.isOffline ? '恢复连接' : '模拟离线' }}
         </button>
@@ -165,6 +168,22 @@ const nav = [
   margin: 8px 0 11px;
   color: #9eb0bc;
   font-size: 11px;
+}
+
+.queue-note {
+  color: #e0b25c !important;
+}
+
+.ghost-link {
+  display: block;
+  margin-bottom: 7px;
+  padding: 8px;
+  border: 1px solid #2e5b51;
+  border-radius: 6px;
+  color: #a9e5df;
+  text-align: center;
+  text-decoration: none;
+  font-size: 12px;
 }
 
 .ghost-button {

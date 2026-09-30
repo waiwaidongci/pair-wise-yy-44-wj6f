@@ -18,18 +18,20 @@ function selectCue(item: Cue) {
 }
 
 function addWaypoint(event: MouseEvent) {
-  if (!showRouteEditor.value || store.locked) return
+  if (!showRouteEditor.value || store.baselineHeld) return
   const target = event.currentTarget as SVGElement
   const rect = target.getBoundingClientRect()
   const x = Math.round(((event.clientX - rect.left) / rect.width) * 100)
   const y = Math.round(((event.clientY - rect.top) / rect.height) * 100)
   store.addWaypoint({ x, y })
-  ElMessage.success('已追加路线节点')
+  ElMessage.success(store.isOffline ? '已记入断网本机队列' : '已追加路线节点')
 }
 
 function saveCue() {
   localStorage.setItem('stage-scheduler-last-action', new Date().toISOString())
-  ElMessage.success(store.isOffline ? '已保存到离线草稿' : `已同步 ${store.revision}`)
+  ElMessage.success(
+    store.isOffline ? '已保存到断网本机队列' : store.locked ? `已写入修订稿 ${store.revision}` : `已同步 ${store.revision}`,
+  )
 }
 
 function submitComment() {
@@ -53,12 +55,36 @@ function updateCue(key: keyof Cue, value: unknown) {
         <p class="muted">选择走位后可直接在平面图追加节点；确认锁定时编辑自动停用。</p>
       </div>
       <div class="actions">
-        <el-button :disabled="!store.canUndo || store.locked" @click="store.undo()">撤销</el-button>
-        <el-button :disabled="!store.canRedo || store.locked" @click="store.redo()">重做</el-button>
-        <el-button type="primary" @click="saveCue">{{ store.isOffline ? '保存草稿' : '同步版本' }}</el-button>
+        <el-button :disabled="!store.canUndo || store.baselineHeld" @click="store.undo()">撤销</el-button>
+        <el-button :disabled="!store.canRedo || store.baselineHeld" @click="store.redo()">重做</el-button>
+        <el-button type="primary" @click="saveCue">{{ store.isOffline ? '断网保存（入队）' : store.locked ? '写入修订稿' : '同步版本' }}</el-button>
       </div>
     </div>
 
+    <el-alert
+      v-if="store.baselineHeld"
+      class="conflict-alert"
+      type="error"
+      show-icon
+      :closable="false"
+      title="演出基线已停住：待核差异影响互锁判断"
+    >
+      <template #default>
+        请前往
+        <RouterLink to="/sync">断网合并台</RouterLink>
+        核对触发时间与路线坐标；核对完成前清单不可编辑，打印中心保留旧版。
+      </template>
+    </el-alert>
+
+    <el-alert
+      v-else-if="store.locked"
+      class="conflict-alert"
+      type="info"
+      show-icon
+      :closable="false"
+      :title="`演出基线 ${store.printRevision} 已锁定，当前改动进入修订稿 ${store.revision}`"
+      description="打印中心继续输出锁定时的旧版清单，修订稿不会进入打印件。"
+    />
     <el-alert
       v-if="store.conflicts.length"
       class="conflict-alert"
@@ -84,9 +110,14 @@ function updateCue(key: keyof Cue, value: unknown) {
         <span>缩放 {{ store.zoom }}%</span>
         <el-slider v-model="store.zoom" :min="70" :max="150" :step="5" style="width: 150px" />
       </div>
-      <el-switch v-model="showRouteEditor" active-text="路线编辑" />
-      <el-button @click="store.addCue" :disabled="store.locked">新增提示</el-button>
-      <el-tag :type="store.locked ? 'success' : 'info'" effect="plain">{{ store.locked ? '基线已锁定' : '草稿编辑中' }}</el-tag>
+      <el-switch v-model="showRouteEditor" :disabled="store.baselineHeld" active-text="路线编辑" />
+      <el-button @click="store.addCue" :disabled="store.baselineHeld">新增提示</el-button>
+      <el-tag :type="store.baselineHeld ? 'danger' : store.locked ? 'warning' : 'info'" effect="plain">
+        {{ store.baselineHeld ? '基线停住' : store.locked ? `修订稿 · 基线 ${store.printRevision}` : '草稿编辑中' }}
+      </el-tag>
+      <el-button v-if="store.offlineOps.length" type="warning" plain size="small" @click="$router.push('/sync')">
+        待合并 {{ store.offlineOps.length }}
+      </el-button>
     </div>
 
     <div class="work-grid">
@@ -126,6 +157,23 @@ function updateCue(key: keyof Cue, value: unknown) {
               </template>
               <template v-if="cue">
                 <circle v-for="(point, index) in cue.route.slice(1, -1)" :key="index" :cx="point.x" :cy="point.y" r="1.5" class="waypoint" />
+                <template v-for="(point, index) in cue.route" :key="`alt-${index}`">
+                  <circle
+                    v-if="point.altX !== undefined && point.altY !== undefined"
+                    :cx="point.altX"
+                    :cy="point.altY"
+                    r="1.8"
+                    class="alt-point"
+                  />
+                  <line
+                    v-if="point.altX !== undefined && point.altY !== undefined"
+                    :x1="point.x"
+                    :y1="point.y"
+                    :x2="point.altX"
+                    :y2="point.altY"
+                    class="alt-link"
+                  />
+                </template>
                 <circle :cx="cue.exit.x" :cy="cue.exit.y" r="2.5" class="exit-point" />
               </template>
             </svg>
@@ -148,7 +196,7 @@ function updateCue(key: keyof Cue, value: unknown) {
             <el-tag :type="cue.status === '已确认' ? 'success' : 'warning'" effect="plain">{{ cue.status }}</el-tag>
           </div>
 
-          <el-form label-position="top" size="small" :disabled="store.locked">
+          <el-form label-position="top" size="small" :disabled="store.baselineHeld">
             <div class="form-grid">
               <el-form-item label="场景">
                 <el-input :model-value="cue.scene" @update:model-value="updateCue('scene', $event)" />
@@ -170,7 +218,9 @@ function updateCue(key: keyof Cue, value: unknown) {
             </el-form-item>
             <el-form-item label="路线节点 / 触发时机">
               <div class="route-summary">
-                <span v-for="(point, index) in cue.route" :key="index">{{ index === 0 ? '入' : index === cue.route.length - 1 ? '出' : index }} ({{ point.x }},{{ point.y }})</span>
+                <span v-for="(point, index) in cue.route" :key="index" :class="{ pending: point.altX !== undefined }">
+                  {{ index === 0 ? '入' : index === cue.route.length - 1 ? '出' : index }} ({{ point.x }},{{ point.y }})<template v-if="point.altX !== undefined"> / 待核 ({{ point.altX }},{{ point.altY }})</template>
+                </span>
               </div>
             </el-form-item>
           </el-form>
@@ -364,6 +414,18 @@ function updateCue(key: keyof Cue, value: unknown) {
   stroke-width: 0.4;
 }
 
+.alt-point {
+  fill: #fbe2da;
+  stroke: #c3493a;
+  stroke-width: 0.5;
+}
+
+.alt-link {
+  stroke: #c3493a;
+  stroke-width: 0.25;
+  stroke-dasharray: 0.8 0.8;
+}
+
 .exit-point {
   fill: #bb4d3e;
   stroke: #fff;
@@ -449,6 +511,12 @@ function updateCue(key: keyof Cue, value: unknown) {
   color: #53606c;
   background: #f6f8f8;
   font-size: 11px;
+}
+
+.route-summary span.pending {
+  border-color: #e3b3aa;
+  color: #a84236;
+  background: #fdf1ef;
 }
 
 .comment-block {

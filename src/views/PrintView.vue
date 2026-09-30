@@ -15,7 +15,7 @@ function print() {
 function exportCsv() {
   const rows = [
     ['编号', '时间码', '场景', '提示', '部门', '责任', '路线节点', '状态'],
-    ...store.cues.map((cue) => [
+    ...store.printCues.map((cue) => [
       cue.id,
       cue.time,
       `${cue.act}/${cue.scene}`,
@@ -30,10 +30,10 @@ function exportCsv() {
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
   const link = document.createElement('a')
   link.href = url
-  link.download = `潮汐来信-走位表-${store.revision}.csv`
+  link.download = `潮汐来信-走位表-${store.printRevision}.csv`
   link.click()
   URL.revokeObjectURL(url)
-  ElMessage.success('走位表已导出')
+  ElMessage.success(`走位表已导出（${store.locked ? '基线旧版 ' + store.printRevision : store.printRevision}）`)
 }
 </script>
 
@@ -51,12 +51,31 @@ function exportCsv() {
       </div>
     </div>
 
+    <el-alert
+      v-if="store.locked"
+      class="no-print hold-print-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`演出基线已锁定：打印中心保留旧版清单 ${store.printRevision}`"
+      :description="`屏幕上的改动属于修订稿（当前 ${store.revision}），不会进入打印件，直到基线解锁重锁。`"
+    />
+    <el-alert
+      v-if="store.baselineHeld"
+      class="no-print hold-print-alert"
+      type="error"
+      show-icon
+      :closable="false"
+      title="演出基线停住：待核差异影响互锁判断"
+      description="请先在断网合并台核对差异，打印清单继续保留旧版。"
+    />
+
     <div class="print-options panel no-print">
       <strong>文档内容</strong>
       <el-checkbox v-model="includeNotes">执行说明</el-checkbox>
       <el-checkbox v-model="includeRoutes">路线坐标</el-checkbox>
       <el-checkbox v-model="includeComments">未解决留言</el-checkbox>
-      <span class="print-revision">版本 {{ store.revision }} · 生成于 {{ new Date().toLocaleString('zh-CN') }}</span>
+      <span class="print-revision">{{ store.locked ? `打印基线 ${store.printRevision} · 修订稿 ${store.revision}` : `版本 ${store.revision}` }} · 生成于 {{ new Date().toLocaleString('zh-CN') }}</span>
     </div>
 
     <article class="print-sheet">
@@ -67,7 +86,7 @@ function exportCsv() {
         </div>
         <dl>
           <div><dt>排练日</dt><dd>2026-10-08</dd></div>
-          <div><dt>版本</dt><dd>{{ store.revision }}</dd></div>
+          <div><dt>版本</dt><dd>{{ store.printRevision }}<template v-if="store.locked">（基线旧版）</template></dd></div>
           <div><dt>场地</dt><dd>上海大剧院 · 大剧场</dd></div>
         </dl>
       </header>
@@ -84,13 +103,16 @@ function exportCsv() {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="cue in [...store.cues].sort((a, b) => a.time.localeCompare(b.time))" :key="cue.id">
+          <tr v-for="cue in [...store.printCues].sort((a, b) => a.time.localeCompare(b.time))" :key="cue.id">
             <td class="mono">{{ cue.time }}</td>
             <td>{{ cue.act }} / {{ cue.scene }}</td>
             <td>
-              <strong>{{ cue.id }} · {{ cue.title }}</strong>
+              <strong>{{ cue.id }} · {{ cue.title }}<el-tag v-if="cue.interlock" size="small" type="danger" effect="plain" class="interlock-tag">互锁</el-tag></strong>
               <p v-if="includeNotes">{{ cue.note }}</p>
               <small v-if="includeRoutes">路线：{{ cue.route.map((point, index) => `${index + 1}. ${point.x}/${point.y}`).join(' → ') }}</small>
+              <small v-for="(point, index) in cue.route.filter((p) => p.altX !== undefined)" :key="`alt-${index}`" class="alt-route">
+                待核：节点 {{ cue.route.indexOf(point) + 1 }} 另有前场导演坐标 {{ point.altX }}/{{ point.altY }}
+              </small>
               <em v-if="includeComments && cue.comments.length">{{ cue.comments.filter((item) => !item.resolved).length }} 条未解决留言</em>
             </td>
             <td>{{ cue.department }}<br /><small>{{ cue.owner }}</small></td>
@@ -112,6 +134,20 @@ function exportCsv() {
 <style scoped>
 .print-page {
   background: #e8ecee;
+}
+
+.hold-print-alert {
+  margin-bottom: 12px;
+}
+
+.interlock-tag {
+  margin-left: 6px;
+  transform: scale(0.85);
+}
+
+.alt-route {
+  display: block;
+  color: #b05a2b !important;
 }
 
 .print-options {

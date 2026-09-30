@@ -19,6 +19,7 @@ const { data: project } = useQuery({
 
 const pending = computed(() => store.cues.filter((cue) => cue.status !== '已确认').length)
 const comments = computed(() => store.cues.reduce((total, cue) => total + cue.comments.filter((item) => !item.resolved).length, 0))
+const diffs = computed(() => store.pendingDiffs.length)
 const totalMinutes = computed(() => Math.round(store.cues.reduce((sum, cue) => sum + cue.duration, 0) / 60))
 const byDepartment = computed(() =>
   ['舞台', '灯光', '音响', '道具'].map((department) => ({
@@ -39,9 +40,25 @@ const nextCues = computed(() => [...store.cues].sort((a, b) => a.time.localeComp
       </div>
       <div class="actions">
         <el-button @click="store.toggleOffline">{{ store.isOffline ? '恢复在线' : '模拟离线' }}</el-button>
+        <el-button :type="store.offlineOps.length ? 'warning' : 'default'" @click="$router.push('/sync')">
+          断网合并<template v-if="store.offlineOps.length">（{{ store.offlineOps.length }}）</template>
+        </el-button>
         <el-button type="primary" @click="$router.push('/stage')">进入舞台工作区</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="store.baselineHeld"
+      class="hold-banner"
+      type="error"
+      show-icon
+      :closable="false"
+      :title="`演出基线停住：${diffs} 项待核差异影响互锁判断`"
+    >
+      <template #default>
+        请先到<RouterLink to="/sync">断网合并台</RouterLink>核对；打印中心保留旧版清单，编辑已暂停。
+      </template>
+    </el-alert>
 
     <div class="metric-grid">
       <article class="metric">
@@ -55,14 +72,14 @@ const nextCues = computed(() => [...store.cues].sort((a, b) => a.time.localeComp
         <small>确认后进入演出基线</small>
       </article>
       <article class="metric">
-        <span>未解决留言</span>
-        <strong class="red">{{ comments }}</strong>
-        <small>跨部门协同处理中</small>
+        <span>待核双端差异</span>
+        <strong :class="diffs ? 'red' : ''">{{ diffs }}</strong>
+        <small>{{ store.offlineOps.length ? `本机队列 ${store.offlineOps.length} 条待合并` : '双方同改时并列待核' }}</small>
       </article>
       <article class="metric">
         <span>计划时长</span>
         <strong>{{ totalMinutes }}<small> 分</small></strong>
-        <small>当前版本 {{ store.revision }}</small>
+        <small>{{ store.locked ? `基线 ${store.printRevision} / 修订稿 ${store.revision}` : `当前版本 ${store.revision}` }}</small>
       </article>
     </div>
 
@@ -115,6 +132,10 @@ const nextCues = computed(() => [...store.cues].sort((a, b) => a.time.localeComp
 
 .red {
   color: #bd4b3f !important;
+}
+
+.hold-banner {
+  margin-bottom: 14px;
 }
 
 .overview-grid {

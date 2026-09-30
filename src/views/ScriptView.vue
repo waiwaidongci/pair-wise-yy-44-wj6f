@@ -22,7 +22,7 @@ function confirmCue(id: string) {
 
 function lock() {
   store.lockBaseline()
-  ElMessage.success('演出基线已锁定，后续修改将从新分支开始')
+  ElMessage.success(`演出基线 ${store.revision} 已锁定，此后改动自动另开修订稿，打印保留旧版`)
 }
 </script>
 
@@ -35,18 +35,39 @@ function lock() {
         <p class="muted">提示与走位按时间码串联；未确认节点不会进入锁定基线。</p>
       </div>
       <div class="actions">
-        <el-button :disabled="store.locked" @click="lock">锁定演出基线</el-button>
-        <el-button v-if="store.locked" type="warning" plain @click="store.unlockBaseline">解锁修订</el-button>
+        <el-button :disabled="store.locked || store.baselineHeld" @click="lock">锁定演出基线</el-button>
+        <el-button v-if="store.locked" type="warning" plain @click="store.unlockBaseline">结束修订（解锁）</el-button>
         <el-button type="primary" @click="$router.push('/print')">生成执行清单</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="store.baselineHeld"
+      class="hold-banner"
+      type="error"
+      show-icon
+      :closable="false"
+      title="演出基线停住：差异影响互锁判断"
+    >
+      <template #default>
+        请到
+        <RouterLink to="/sync">断网合并台</RouterLink>
+        核对 {{ store.pendingDiffs.length }} 项待核差异；全部裁决前不能继续编辑或重锁基线。
+      </template>
+    </el-alert>
 
     <div class="panel script-toolbar">
       <el-input v-model="query" clearable placeholder="搜索提示、角色或说明" style="max-width: 320px" />
       <el-segmented v-model="selectedAct" :options="acts" />
       <div class="baseline-status">
-        <span class="status-dot" :style="{ background: store.locked ? '#41936b' : '#d68c27' }" />
-        {{ store.locked ? `基线 ${store.revision} 已锁定` : `${store.revision} · ${store.cues.filter((cue) => cue.status !== '已确认').length} 项待确认` }}
+        <span class="status-dot" :style="{ background: store.baselineHeld ? '#cf4436' : store.locked ? '#41936b' : '#d68c27' }" />
+        {{
+          store.baselineHeld
+            ? `基线停住 · ${store.pendingDiffs.length} 项互锁待核`
+            : store.locked
+              ? `基线 ${store.printRevision} 已锁定 · 修订稿 ${store.revision}`
+              : `${store.revision} · ${store.cues.filter((cue) => cue.status !== '已确认').length} 项待确认`
+        }}
       </div>
     </div>
 
@@ -64,7 +85,7 @@ function lock() {
           <div class="script-card panel">
             <div class="script-card-head">
               <div>
-                <span>{{ cue.id }} · {{ cue.act }} / {{ cue.scene }}</span>
+                <span>{{ cue.id }} · {{ cue.act }} / {{ cue.scene }}<el-tag v-if="cue.interlock" size="small" type="danger" effect="plain" class="interlock-mini">互锁</el-tag></span>
                 <h3>{{ cue.title }}</h3>
               </div>
               <el-tag :type="cue.status === '已确认' ? 'success' : cue.status === '待确认' ? 'warning' : 'info'" effect="plain">
@@ -125,6 +146,15 @@ function lock() {
   gap: 14px;
   margin-bottom: 18px;
   padding: 12px 14px;
+}
+
+.hold-banner {
+  margin-bottom: 14px;
+}
+
+.interlock-mini {
+  margin-left: 6px;
+  transform: scale(0.85);
 }
 
 .baseline-status {
